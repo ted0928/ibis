@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from public import public
@@ -10,6 +10,7 @@ import ibis.common.exceptions as com
 import ibis.expr.builders as bl
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
+from ibis import util
 from ibis.common.deferred import Deferred, _, deferrable
 from ibis.common.grounds import Singleton
 from ibis.expr.rewrites import rewrite_window_input
@@ -717,19 +718,16 @@ class Value(Expr):
         └────────┴──────────────┘
         """
         if isinstance(value, dict):
-            expr = ibis.case()
-            try:
-                null_replacement = value.pop(None)
-            except KeyError:
-                pass
-            else:
-                expr = expr.when(self.isnull(), null_replacement)
-            for k, v in value.items():
-                expr = expr.when(self == k, v)
+            branches = sorted(value.items())
         else:
-            expr = self.case().when(value, replacement)
-
-        return expr.else_(else_ if else_ is not None else self).end()
+            branches = [(value, replacement)]
+        nulls = [(k, v) for k, v in branches if k is None]
+        nonnulls = [(k, v) for k, v in branches if k is not None]
+        if nulls:
+            null_replacement = nulls[0][1]
+            self = self.fillna(null_replacement)
+        else_ = else_ if else_ is not None else self
+        return self.cases(*nonnulls, else_=else_)
 
     def over(
         self,
@@ -865,99 +863,32 @@ class Value(Expr):
         """
         return ops.NotNull(self).to_expr()
 
+    @util.deprecated(instead="use Value.cases() instead", as_of="9.0")
     def case(self) -> bl.SimpleCaseBuilder:
-        """Create a SimpleCaseBuilder to chain multiple if-else statements.
-
-        Add new search expressions with the `.when()` method. These must be
-        comparable with this column expression. Conclude by calling `.end()`.
-
-        Returns
-        -------
-        SimpleCaseBuilder
-            A case builder
-
-        See Also
-        --------
-        [`Value.substitute()`](./expression-generic.qmd#ibis.expr.types.generic.Value.substitute)
-        [`ibis.cases()`](./expression-generic.qmd#ibis.expr.types.generic.Value.cases)
-        [`ibis.case()`](./expression-generic.qmd#ibis.case)
-
-        Examples
-        --------
-        >>> import ibis
-        >>> ibis.options.interactive = True
-        >>> x = ibis.examples.penguins.fetch().head(5)["sex"]
-        >>> x
-        ┏━━━━━━━━┓
-        ┃ sex    ┃
-        ┡━━━━━━━━┩
-        │ string │
-        ├────────┤
-        │ male   │
-        │ female │
-        │ female │
-        │ NULL   │
-        │ female │
-        └────────┘
-        >>> x.case().when("male", "M").when("female", "F").else_("U").end()
-        ┏━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ SimpleCase(sex, 'U') ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━┩
-        │ string               │
-        ├──────────────────────┤
-        │ M                    │
-        │ F                    │
-        │ F                    │
-        │ U                    │
-        │ F                    │
-        └──────────────────────┘
-
-        Cases not given result in the ELSE case
-
-        >>> x.case().when("male", "M").else_("OTHER").end()
-        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ SimpleCase(sex, 'OTHER') ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-        │ string                   │
-        ├──────────────────────────┤
-        │ M                        │
-        │ OTHER                    │
-        │ OTHER                    │
-        │ OTHER                    │
-        │ OTHER                    │
-        └──────────────────────────┘
-
-        If you don't supply an ELSE, then NULL is used
-
-        >>> x.case().when("male", "M").end()
-        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ SimpleCase(sex, Cast(None, string)) ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-        │ string                              │
-        ├─────────────────────────────────────┤
-        │ M                                   │
-        │ NULL                                │
-        │ NULL                                │
-        │ NULL                                │
-        │ NULL                                │
-        └─────────────────────────────────────┘
-        """
-        import ibis.expr.builders as bl
-
+        """DEPRECATED: Use `self.cases()` instead."""
         return bl.SimpleCaseBuilder(self.op())
 
     def cases(
         self,
-        case_result_pairs: Iterable[tuple[ir.BooleanValue, Value]],
-        default: Value | None = None,
+        *branches: tuple[Value, Value],
+        else_: Value | None = None,
     ) -> Value:
-        """Create a case expression in one shot.
+        """Create a multi-branch if-else expression.
+
+        This is semantically equivalent to
+        CASE self
+          WHEN test_val0 THEN result0
+          WHEN test_val1 THEN result1
+          ELSE else_
+        END
 
         Parameters
         ----------
-        case_result_pairs
-            Conditional-result pairs
-        default
+        branches
+            (test_val, result) pairs. We look through the test values in order
+            and return the result corresponding to the first test value that
+            matches `self`. If none match, we return `else_`.
+        else_
             Value to return if none of the case conditions are true
 
         Returns
@@ -968,48 +899,52 @@ class Value(Expr):
         See Also
         --------
         [`Value.substitute()`](./expression-generic.qmd#ibis.expr.types.generic.Value.substitute)
-        [`ibis.cases()`](./expression-generic.qmd#ibis.expr.types.generic.Value.cases)
-        [`ibis.case()`](./expression-generic.qmd#ibis.case)
+        [`ibis.cases()`](./expression-generic.qmd#ibis.cases)
 
         Examples
         --------
         >>> import ibis
         >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"values": [1, 2, 1, 2, 3, 2, 4]})
-        >>> t
-        ┏━━━━━━━━┓
-        ┃ values ┃
-        ┡━━━━━━━━┩
-        │ int64  │
-        ├────────┤
-        │      1 │
-        │      2 │
-        │      1 │
-        │      2 │
-        │      3 │
-        │      2 │
-        │      4 │
-        └────────┘
-        >>> number_letter_map = ((1, "a"), (2, "b"), (3, "c"))
-        >>> t.values.cases(number_letter_map, default="unk").name("replace")
-        ┏━━━━━━━━━┓
-        ┃ replace ┃
-        ┡━━━━━━━━━┩
-        │ string  │
-        ├─────────┤
-        │ a       │
-        │ b       │
-        │ a       │
-        │ b       │
-        │ c       │
-        │ b       │
-        │ unk     │
-        └─────────┘
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "left": [5, 6, 7, 8, 9],
+        ...         "symbol": ["+", "-", "*", "/", "bogus"],
+        ...         "right": [1, 2, 3, 4, 5],
+        ...     }
+        ... )
+        >>> t.mutate(
+        ...     result=(
+        ...         t.symbol.cases(
+        ...             ("+", t.left + t.right),
+        ...             ("-", t.left - t.right),
+        ...             ("*", t.left * t.right),
+        ...             ("/", t.left / t.right),
+        ...         )
+        ...     )
+        ... )
+        ┏━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━━━┓
+        ┃ left  ┃ symbol ┃ right ┃ result  ┃
+        ┡━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━━━┩
+        │ int64 │ string │ int64 │ float64 │
+        ├───────┼────────┼───────┼─────────┤
+        │     5 │ +      │     1 │     6.0 │
+        │     6 │ -      │     2 │     4.0 │
+        │     7 │ *      │     3 │    21.0 │
+        │     8 │ /      │     4 │     2.0 │
+        │     9 │ bogus  │     5 │    NULL │
+        └───────┴────────┴───────┴─────────┘
         """
-        builder = self.case()
-        for case, result in case_result_pairs:
-            builder = builder.when(case, result)
-        return builder.else_(default).end()
+        for b in branches:
+            try:
+                test, result = b
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    "Each branch must be a tuple of (condition, result)"
+                ) from e
+        cases, results = zip(*branches) if branches else ([], [])
+        return ops.SimpleCase(
+            base=self, cases=cases, results=results, default=else_
+        ).to_expr()
 
     def collect(self, where: ir.BooleanValue | None = None) -> ir.ArrayScalar:
         """Aggregate this expression's elements into an array.
