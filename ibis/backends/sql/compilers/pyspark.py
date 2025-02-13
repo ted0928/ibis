@@ -5,8 +5,10 @@ import itertools
 import operator
 import re
 
+import pyspark
 import sqlglot as sg
 import sqlglot.expressions as sge
+from packaging.version import parse as vparse
 
 import ibis
 import ibis.common.exceptions as com
@@ -26,6 +28,8 @@ from ibis.common.patterns import replace
 from ibis.config import options
 from ibis.expr.operations.udf import InputType
 from ibis.util import gen_name
+
+PYSPARK_GT_34 = vparse(pyspark.__version__) >= vparse("3.4")
 
 
 @replace(p.Limit)
@@ -272,7 +276,12 @@ class PySparkCompiler(SQLGlotCompiler):
         # For Spark>=3.4 we could use any_value here
         if where is not None:
             arg = self.if_(where, arg, NULL)
-        return sge.IgnoreNulls(this=self.f.first(arg))
+
+        if PYSPARK_GT_34:
+            out = self.f.any_value(arg)
+        else:
+            out = self.f.first(arg)
+        return sge.IgnoreNulls(this=out)
 
     def visit_Median(self, op, *, arg, where):
         return self.agg.percentile(arg, 0.5, where=where)

@@ -65,6 +65,18 @@ def test_group_by(t, df):
     tm.assert_frame_equal(result, expected)
 
 
+def test_arbitrary(t, df):
+    result = (
+        t.mutate(fix_id=ibis.literal("a"))
+        .group_by("id")
+        .aggregate(arbitrary=ibis._.fix_id.arbitrary())
+        .select("id", "arbitrary")
+        .execute()
+    )
+    expected = df[["id"]].assign(arbitrary="a")
+    tm.assert_frame_equal(result, expected)
+
+
 def test_window(t, df):
     w = ibis.window()
     result = t.mutate(grouped_demeaned=t["id"] - t["id"].mean().over(w)).execute()
